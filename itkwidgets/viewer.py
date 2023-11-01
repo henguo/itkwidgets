@@ -6,6 +6,9 @@ from typing import List, Union, Tuple
 from IPython.display import display, HTML
 from IPython.lib import backgroundjobs as bg
 import uuid
+import numpy as np
+import torch
+import SimpleITK as sitk
 
 from ._type_aliases import Gaussians, Style, Image, PointSet
 from ._initialization_params import (
@@ -35,7 +38,7 @@ class ViewerRPC:
     """Viewer remote procedure interface."""
 
     def __init__(
-        self, ui_collapsed=True, rotate=False, ui="pydata-sphinx", init_data=None, **add_data_kwargs
+        self, ui_collapsed=True, rotate=False, ui="pydata-sphinx", init_data=None, left_fn=None, right_fn=None, **add_data_kwargs
     ):
         global _codecs_registered
         """Create a viewer."""
@@ -50,10 +53,15 @@ class ViewerRPC:
         self.init_data = init_data
         self.img = display(HTML(f'<div />'), display_id=str(uuid.uuid4()))
         self.wid = None
+        self.points = []
+        self.labels = []
+        self.left_fn = left_fn
+        self.right_fn = right_fn
+        self.mask_input = None
         if ENVIRONMENT is not Env.JUPYTERLITE and ENVIRONMENT is not Env.HYPHA:
             self.viewer_event = threading.Event()
             self.data_event = threading.Event()
-
+        
     async def setup(self):
         pass
 
@@ -94,6 +102,12 @@ class ViewerRPC:
             # screenshot is updated when the user requests
             itk_viewer.registerEventListener(
                 'screenshotTaken', self.update_screenshot
+            )
+            itk_viewer.registerEventListener(
+                'leftclickCallback', self.left_fn
+            )
+            itk_viewer.registerEventListener(
+                'rightclickCallback', self.right_fn
             )
 
     def set_default_ui_values(self, itk_viewer):
@@ -136,19 +150,62 @@ class Viewer:
         data = build_init_data(input_data)
         if ENVIRONMENT is not Env.HYPHA:
             self.viewer_rpc = ViewerRPC(
-                ui_collapsed=ui_collapsed, rotate=rotate, ui=ui, init_data=data, **add_data_kwargs
+                ui_collapsed=ui_collapsed, rotate=rotate, ui=ui, init_data=data, left_fn=self.left_click_callback, right_fn=self.right_click_callback, **add_data_kwargs
             )
             if ENVIRONMENT is not Env.JUPYTERLITE:
                 self.bg_jobs = bg.BackgroundJobManager()
                 self.queue = queue.Queue()
                 self.deferred_queue = queue.Queue()
                 self.bg_thread = self.bg_jobs.new(self.queue_worker)
+            
             api.export(self.viewer_rpc)
         else:
             self._itk_viewer = add_data_kwargs.get('itk_viewer', None)
             self.server = add_data_kwargs.get('server', None)
             self.workspace = self.server.config.workspace
+        
+        self.points = []
+        self.labels = []
+        self.mask_input = None
+        self.predictor = add_data_kwargs.get('predictor', None)
 
+    def left_click_callback(self, event_data):
+        x = event_data.iIndex
+        y = event_data.jIndex
+        z = event_data.kIndex
+        
+        self.points.append([x, y, z])
+        self.labels.append(1)
+        mask, scores, logits = self.predictor.predict(
+            point_coords=np.array(self.points),
+            point_labels=np.array(self.labels),
+            multimask_output=False,
+            mask_input=self.mask_input,
+        )
+        
+        self.mask_input = logits
+        self.set_label_image(sitk.GetArrayFromImage(mask))
+        
+    def right_click_callback(self, event_data):
+        x = event_data.iIndex
+        y = event_data.jIndex
+        z = event_data.kIndex
+        
+        self.points.append([x, y, z])
+        if len(self.labels) == 0:
+            self.labels.append(1)
+        else:
+            self.labels.append(0)
+        mask, scores, logits = self.predictor.predict(
+            point_coords=np.array(self.points),
+            point_labels=np.array(self.labels),
+            multimask_output=False,
+            mask_input=self.mask_input,
+        )
+
+        self.mask_input = logits
+        self.set_label_image(sitk.GetArrayFromImage(mask))
+        
     @property
     def loop(self):
         return asyncio.get_running_loop()
@@ -455,7 +512,9 @@ def view(data=None, **kwargs):
         the framerate.
     units: string, default: ''
         Units to display in the scale bar.
-
+    predictor: SamPredictor, default: None
+        Interactive model for inference
+        
     Returns
     -------
     viewer : ipywidget
