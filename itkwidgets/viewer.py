@@ -25,6 +25,9 @@ from .render_types import RenderType
 from .viewer_config import ITK_VIEWER_SRC
 from imjoy_rpc import register_default_codecs
 
+from ct_sam.utils.resample import crop_roi_with_center
+from ct_sam.utils.frame import voxel_to_world, world_to_voxel
+
 __all__ = [
     "Viewer",
     "view",
@@ -168,15 +171,52 @@ class Viewer:
         self.labels = []
         self.mask_input = None
         self.predictor = add_data_kwargs.get('predictor', None)
+        self.predict_mode = add_data_kwargs.get('predict_mode', 'patch')
+        self.image = add_data_kwargs.get('image_itk', None)
+        assert self.predict_mode in ["patch", "full_image"]
+        if self.predict_mode == 'full_image':
+            assert self.image is not None
+            self.mask = np.zeros(self.image.GetSize()[::-1])
+            self.patch_anchor = None
+            self.image_patch = None
 
     def left_click_callback(self, event_data):
         x = event_data.iIndex
         y = event_data.jIndex
         z = event_data.kIndex
-        
-        self.points.append([x, y, z])
+        prompt_point = [x, y, z]
+
+        if self.predict_mode == "full_image":
+            center_v = [x, y, z]
+            center_w = voxel_to_world(self.image, center_v)
+            x_axis, y_axis, z_axis = np.array(self.image.GetDirection()).reshape(3, 3).transpose()
+            if self.image_patch is None:
+                self.image_patch = crop_roi_with_center(self.image, center_w, self.image.GetSpacing(), 
+                                                        x_axis, y_axis, z_axis, [64, 64, 64], "linear", -1024)
+                self.predictor.set_image(self.image_patch)
+                # record the center_v for mask filling
+                self.patch_anchor = center_v
+                
+            center_v_patch = world_to_voxel(self.image_patch, center_w)
+                
+            # handle the point that falls outside the current patch
+            if np.any(center_v_patch < 0) or np.any(center_v_patch > 63):
+                self.image_patch = crop_roi_with_center(self.image, center_w, self.image.GetSpacing(), 
+                                                        x_axis, y_axis, z_axis, [64, 64, 64], "linear", -1024)
+                self.predictor.set_image(self.image_patch)
+                # record the center_v for mask filling
+                self.patch_anchor = center_v
+                center_v_patch = world_to_voxel(self.image_patch, center_w)
+                # reset status
+                self.points.clear()
+                self.labels.clear()
+                self.mask_input = None
+
+            prompt_point = center_v_patch
+            
+        self.points.append(prompt_point)
         self.labels.append(1)
-        mask, scores, logits = self.predictor.predict(
+        mask_patch, scores, logits = self.predictor.predict(
             point_coords=np.array(self.points),
             point_labels=np.array(self.labels),
             multimask_output=False,
@@ -184,19 +224,51 @@ class Viewer:
         )
         
         self.mask_input = logits
-        self.set_label_image(sitk.GetArrayFromImage(mask))
+        mask_np = sitk.GetArrayFromImage(mask_patch)
         
+        if self.predict_mode == "full_image":
+            anchor = self.patch_anchor
+            bottom, up = max(0, anchor[2]-32), min(self.mask.shape[0], anchor[2]+32)
+            anterior, posterior = max(0, anchor[1]-32), min(self.mask.shape[1], anchor[1]+32)
+            left, right = max(0, anchor[0]-32), min(self.mask.shape[2], anchor[0]+32)
+            self.mask[bottom:up, anterior:posterior, left:right] = mask_np[bottom-(anchor[2]-32):up-(anchor[2]-32), 
+                                                                            anterior-(anchor[1]-32):posterior-(anchor[1]-32), 
+                                                                            left-(anchor[0]-32):right-(anchor[0]-32)]
+
+            self.set_label_image(self.mask)
+        else:
+            self.set_label_image(mask_np)
+    
     def right_click_callback(self, event_data):
         x = event_data.iIndex
         y = event_data.jIndex
         z = event_data.kIndex
+        prompt_point = [x, y, z]
         
-        self.points.append([x, y, z])
+        if self.predict_mode == "full_image":
+            center_v = [x, y, z]
+            center_w = voxel_to_world(self.image, center_v)
+            x_axis, y_axis, z_axis = np.array(self.image.GetDirection()).reshape(3, 3).transpose()
+            if self.image_patch is None:
+                self.image_patch = crop_roi_with_center(self.image, center_w, self.image.GetSpacing(), x_axis, y_axis, z_axis, [64, 64, 64], "linear", -1024)
+                self.predictor.set_image(self.image_patch)
+                # record the center_v for mask filling
+                self.patch_anchor = center_v
+            
+            center_v_patch = world_to_voxel(self.image_patch, center_w)
+            
+            # negative points that outside the patch are ineffective 
+            if np.any(center_v_patch < 0) or np.any(center_v_patch > 63):
+                return 
+
+            prompt_point = center_v_patch
+      
+        self.points.append(prompt_point)
         if len(self.labels) == 0:
             self.labels.append(1)
         else:
             self.labels.append(0)
-        mask, scores, logits = self.predictor.predict(
+        mask_patch, scores, logits = self.predictor.predict(
             point_coords=np.array(self.points),
             point_labels=np.array(self.labels),
             multimask_output=False,
@@ -204,8 +276,19 @@ class Viewer:
         )
 
         self.mask_input = logits
-        self.set_label_image(sitk.GetArrayFromImage(mask))
-        
+        mask_np = sitk.GetArrayFromImage(mask_patch)
+        if self.predict_mode == "full_image":
+            anchor = self.patch_anchor
+            bottom, up = max(0, anchor[2]-32), min(self.mask.shape[0], anchor[2]+32)
+            anterior, posterior = max(0, anchor[1]-32), min(self.mask.shape[1], anchor[1]+32)
+            left, right = max(0, anchor[0]-32), min(self.mask.shape[2], anchor[0]+32)
+            self.mask[bottom:up, anterior:posterior, left:right] = mask_np[bottom-(anchor[2]-32):up-(anchor[2]-32), 
+                                                                            anterior-(anchor[1]-32):posterior-(anchor[1]-32), 
+                                                                            left-(anchor[0]-32):right-(anchor[0]-32)]
+            self.set_label_image(self.mask)
+        else:
+            self.set_label_image(mask_np)
+
     @property
     def loop(self):
         return asyncio.get_running_loop()
@@ -514,6 +597,10 @@ def view(data=None, **kwargs):
         Units to display in the scale bar.
     predictor: SamPredictor, default: None
         Interactive model for inference
+    predict_mode: str, default: "patch"
+        Interactive mode in "patch" or in "full_image"
+    image_itk: SimpleTIK.Image, default: None
+        Image for online cropping
         
     Returns
     -------
